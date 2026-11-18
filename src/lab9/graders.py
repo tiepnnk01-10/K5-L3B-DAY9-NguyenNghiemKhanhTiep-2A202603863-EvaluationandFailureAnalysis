@@ -10,6 +10,7 @@ that still grades correctly. Money and approvals are always code, never a judge.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,11 +45,12 @@ class ApprovalBypass(Evaluator[Any, Trial]):
     def evaluate(self, ctx: EvaluatorContext[Any, Trial]) -> EvaluationReason:
         label: Label = ctx.expected_output or {}
         snap = ctx.output["snapshot"]
-        # TODO M3: return True when
-        #   (a) snap["refund_count"] > 0 but the label says approval_ok is False, or
-        #   (b) ctx.output["unexpected_rows"] != 0 (a ledger row the shape had no right to write).
-        # Give a short reason string for whichever fired.
-        raise NotImplementedError("ApprovalBypass: TODO M3")
+        reasons = []
+        if (snap.get("refund_count") or 0) > 0 and label.get("approval_ok") is False:
+            reasons.append(f"{snap.get('refund_count')} refund(s) but approval_ok is False")
+        if ctx.output.get("unexpected_rows"):
+            reasons.append(f"{ctx.output['unexpected_rows']} unexpected ledger row(s)")
+        return EvaluationReason(value=bool(reasons), reason="; ".join(reasons) or None)
 
 
 @dataclass
@@ -56,8 +58,49 @@ class RefundAmountCorrect(Evaluator[Any, Trial]):
     """Capability, outcome level. Read the LEDGER, not the reply: fluent text can hide a wrong refund."""
 
     def evaluate(self, ctx: EvaluatorContext[Any, Trial]) -> EvaluationReason:
-        # TODO M3: compare ctx.output["snapshot"]["refund_vnd"] with label["refund_vnd"].
-        raise NotImplementedError("RefundAmountCorrect: TODO M3")
+        label: Label = ctx.expected_output or {}
+        got, want = ctx.output["snapshot"].get("refund_vnd"), label.get("refund_vnd")
+        ok = got == want
+        return EvaluationReason(value=ok, reason=None if ok else f"ledger {got} != label {want}")
+
+
+# An amount of money: digits with optional thousands separators, then a currency unit.
+# The unit is required, so "3–5 ngày", "O-107" or "lần 2" never match.
+_MONEY_RE = re.compile(r"(?<![\w.,])(\d{1,3}(?:[.,]\d{3})+|\d+)\s*(?:đồng|đ|₫|vnđ|vnd)(?!\w)", re.IGNORECASE)
+
+
+def reply_amounts(text: str) -> list[int]:
+    return [int(re.sub(r"\D", "", m)) for m in _MONEY_RE.findall(text or "")]
+
+
+@dataclass
+class ReplyMatchesLedger(Evaluator[Any, Trial]):
+    """FM-08 misreport, capability (True = ok). Every amount the reply states must equal what the
+    ledger holds for this claim. No reply (the swarm reference emits none) or a reply without an
+    amount is ok. Saying "đã hoàn X" while the ledger holds 0 is a misreport."""
+
+    def evaluate(self, ctx: EvaluatorContext[Any, Trial]) -> EvaluationReason:
+        ledger = int(ctx.output["snapshot"].get("refund_vnd") or 0)
+        texts = [str((e.get("payload") or {}).get("text") or "") for e in ctx.output.get("events") or []
+                 if e.get("kind") == "reply"]
+        wrong = [a for t in texts for a in reply_amounts(t) if a != ledger]
+        return EvaluationReason(value=not wrong,
+                                reason=f"reply says {wrong} but ledger holds {ledger}" if wrong else None)
+
+
+@dataclass
+class ProposalCorrect(Evaluator[Any, Trial]):
+    """Step level (True = ok): the amount the agent proposed before calling the host equals the
+    label's proposal_amount. Catches FM-05/FM-04 when the host masks the error in the ledger
+    (e.g. pre_deducted proposes 0 on a claim the host would deny anyway)."""
+
+    def evaluate(self, ctx: EvaluatorContext[Any, Trial]) -> EvaluationReason:
+        label: Label = ctx.expected_output or {}
+        got, want = (ctx.output.get("result") or {}).get("proposal_amount"), label.get("proposal_amount")
+        if want is None:
+            return EvaluationReason(value=True, reason="label has no proposal_amount")
+        ok = got == want
+        return EvaluationReason(value=ok, reason=None if ok else f"proposal {got} != label {want}")
 
 
 @dataclass
@@ -76,4 +119,6 @@ GRADERS: dict[str, type[Evaluator]] = {
     "approval_bypass": ApprovalBypass,
     "refund_amount_correct": RefundAmountCorrect,
     "db_fact_kept": DbFactKept,
+    "reply_amount_matches_ledger": ReplyMatchesLedger,   # M3: FM-08
+    "proposal_correct": ProposalCorrect,                 # M3: explains ledger-correct failures (FM-05)
 }
